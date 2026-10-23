@@ -47,6 +47,9 @@ class CinematicFlow {
             interactive: true,
             showTelemetry: true,
             zoomOnClick: true,
+            maxDpr: 1.5,
+            performanceModeOnDrag: true,
+            maxPackets: 25,
             onNodeClick: null,
             onCanvasClick: null,
          },
@@ -89,6 +92,14 @@ class CinematicFlow {
       this.dragOffset = { x: 0, y: 0 };
       this.lastMousePos = { x: 0, y: 0 };
       this.hoveredNode = null;
+
+      // Event System
+      this._eventListeners = {};
+
+      // Spawner State
+      this._spawnerInterval = null;
+      this._autoSpawnNodes = new Set();
+      this._autoSpawnRoutes = new Map();
 
       // Recording
       this.mediaRecorder = null;
@@ -163,8 +174,87 @@ class CinematicFlow {
    // ==========================================
 
    /**
+    * Internal helper to measure text width unscaled.
+    * Uses canvas 2D context measureText if available, with accurate fallback.
+    * @private
+    */
+   _measureTextWidth(text, font) {
+      if (!text) return 0;
+      if (this.ctx && typeof this.ctx.measureText === "function") {
+         try {
+            this.ctx.font = font;
+            return this.ctx.measureText(text).width;
+         } catch (e) {}
+      }
+      const isMono = font.includes("Mono");
+      const sizeMatch = font.match(/(\d+(?:\.\d+)?)px/);
+      const fontSize = sizeMatch ? parseFloat(sizeMatch[1]) : 12;
+      const charWidth = isMono ? fontSize * 0.62 : fontSize * 0.55;
+      return text.length * charWidth;
+   }
+
+   /**
+    * Calculate auto dimensions for a node based on its label and sublabel length.
+    * Ensures long labels and sublabels never overflow the container.
+    * @private
+    */
+   _calculateNodeDimensions(nodeConfig) {
+      const type = (nodeConfig.type || "square").toLowerCase();
+      const label = String(nodeConfig.label || "").trim();
+      const sublabel = String(nodeConfig.sublabel || nodeConfig.sub || "").trim();
+
+      // Measure text width using 1x unscaled reference fonts
+      const labelFont =
+         type === "conditional" || type === "input" || type === "output"
+            ? "600 11px 'JetBrains Mono', monospace"
+            : "600 12px 'JetBrains Mono', monospace";
+      const subFont = "500 9px 'Plus Jakarta Sans', sans-serif";
+
+      const labelWidth = this._measureTextWidth(label, labelFont);
+      const subWidth = this._measureTextWidth(sublabel, subFont);
+      const maxContentWidth = Math.max(labelWidth, subWidth);
+
+      let minWidth = 170;
+      let extraPadding = 36;
+      let h = nodeConfig.height || 64;
+
+      if (type === "conditional") {
+         minWidth = 150;
+         h = nodeConfig.height || 74;
+         // Rhombus diamond narrows significantly towards top & bottom (sublabel is at cy + 18px)
+         const diamondWidthForSub = subWidth * 1.8 + 40;
+         const diamondWidthForLabel = labelWidth + 80;
+         const calculatedWidth = Math.ceil(Math.max(diamondWidthForLabel, diamondWidthForSub));
+         const w = Math.max(nodeConfig.width || minWidth, calculatedWidth);
+         return { width: w, height: h };
+      } else if (type === "input") {
+         minWidth = 160;
+         extraPadding = 68; // Radio waves icon (40px) + right pill cap (28px)
+         h = nodeConfig.height || 58;
+      } else if (type === "output") {
+         minWidth = 160;
+         extraPadding = 56; // Left margin (14px) + right delivery badge (28px) + buffer
+         h = nodeConfig.height || 58;
+      } else if (type === "database") {
+         minWidth = 180;
+         extraPadding = 56; // Left margin (28px) + right margin (28px)
+         h = nodeConfig.height || 84;
+      } else if (type === "thread") {
+         minWidth = 175;
+         extraPadding = 80; // Cog icon (32px) + sparkline bars on right (45px)
+         h = nodeConfig.height || 68;
+      }
+
+      const calculatedWidth = Math.ceil(maxContentWidth + extraPadding);
+      const w = Math.max(nodeConfig.width || minWidth, calculatedWidth);
+
+      return { width: w, height: h };
+   }
+
+   /**
     * Add a node to the diagram.
     * Supported types: 'square', 'conditional', 'input', 'output', 'database', 'thread'
+    * Auto-sizes node width to prevent label/sublabel overflow.
     */
    addNode(nodeConfig) {
       const id =
@@ -185,31 +275,26 @@ class CinematicFlow {
                     ? "green"
                     : "blue");
 
-      // Dimension presets based on type
-      let w = nodeConfig.width || 170;
-      let h = nodeConfig.height || 64;
-      if (type === "conditional") {
-         w = nodeConfig.width || 150;
-         h = nodeConfig.height || 74;
-      } else if (type === "input" || type === "output") {
-         w = nodeConfig.width || 160;
-         h = nodeConfig.height || 58;
-      } else if (type === "database") {
-         w = nodeConfig.width || 180;
-         h = nodeConfig.height || 84;
-      } else if (type === "thread") {
-         w = nodeConfig.width || 175;
-         h = nodeConfig.height || 68;
-      }
+      const label = nodeConfig.label || `Node ${id}`;
+      const sublabel =
+         nodeConfig.sublabel ||
+         nodeConfig.sub ||
+         this._getDefaultSublabel(type);
+
+      // Auto-calculate width so label or sublabel never overflow
+      const dimensions = this._calculateNodeDimensions({
+         type,
+         label,
+         sublabel,
+         width: nodeConfig.width,
+         height: nodeConfig.height,
+      });
 
       const node = {
          id,
          type,
-         label: nodeConfig.label || `Node ${id}`,
-         sublabel:
-            nodeConfig.sublabel ||
-            nodeConfig.sub ||
-            this._getDefaultSublabel(type),
+         label,
+         sublabel,
          group: nodeConfig.group || null,
          forcedState:
             nodeConfig.forcedState !== undefined
@@ -223,8 +308,8 @@ class CinematicFlow {
                : "auto",
          x: nodeConfig.x || 100,
          y: nodeConfig.y || 100,
-         width: w,
-         height: h,
+         width: dimensions.width,
+         height: dimensions.height,
          color: colorKey,
          pulse: 0,
          spawnAnim: 1.0, // For thread spawn animation
@@ -461,6 +546,145 @@ class CinematicFlow {
    }
 
    /**
+    * Find an outgoing edge from a source node that matches a selector.
+    * Selector can be:
+    *  - target node ID (e.g. 'isFlagExist')
+    *  - connection label (e.g. 'normal', 'major')
+    *  - connection color (e.g. 'green', 'amber')
+    *  - connection condition (e.g. 'true', 'false')
+    *  - an object: { to/target, label, color, condition }
+    * @param {string} sourceId - ID of origin node
+    * @param {string|Object} selector - Target node ID, label, color, or selector object
+    * @returns {Object|null} Matching edge or null
+    */
+   _findEdgeBySelector(sourceId, selector) {
+      if (!sourceId || !selector) return null;
+      const outEdges = this.edges.filter((e) => e.source === sourceId);
+      if (outEdges.length === 0) return null;
+
+      // 1. Selector as object
+      if (typeof selector === "object" && selector !== null) {
+         const target = selector.target || selector.to;
+         const label = selector.label;
+         const color = selector.color;
+         const condition = selector.condition;
+
+         return (
+            outEdges.find((e) => {
+               if (target && e.target !== target) return false;
+               if (
+                  label &&
+                  (!e.label ||
+                     e.label.toLowerCase() !== String(label).toLowerCase())
+               )
+                  return false;
+               if (
+                  color &&
+                  (!e.color ||
+                     e.color.toLowerCase() !== String(color).toLowerCase())
+               )
+                  return false;
+               if (
+                  condition &&
+                  (!e.condition ||
+                     e.condition.toLowerCase() !==
+                        String(condition).toLowerCase())
+               )
+                  return false;
+               return true;
+            }) || null
+         );
+      }
+
+      // 2. Selector as string
+      if (typeof selector === "string") {
+         const str = selector.trim();
+         if (!str) return null;
+
+         // Direct match on target node ID
+         let match = outEdges.find((e) => e.target === str);
+         if (match) return match;
+
+         // Match on edge label (case-insensitive)
+         match = outEdges.find(
+            (e) => e.label && e.label.toLowerCase() === str.toLowerCase(),
+         );
+         if (match) return match;
+
+         // Match on condition
+         match = outEdges.find(
+            (e) =>
+               e.condition && e.condition.toLowerCase() === str.toLowerCase(),
+         );
+         if (match) return match;
+
+         // Match on color
+         match = outEdges.find(
+            (e) => e.color && e.color.toLowerCase() === str.toLowerCase(),
+         );
+         if (match) return match;
+      }
+
+      return null;
+   }
+
+   /**
+    * Check if an edge is allowed under the current node conditional constraints (forcedState)
+    */
+   _isEdgeAllowed(edge, srcNode) {
+      if (!edge || !srcNode) return false;
+      if (srcNode.type === "conditional") {
+         const { trueEdge, falseEdge } = this._getConditionalEdges(srcNode.id);
+         if (
+            (srcNode.forcedState === false || srcNode.forcedState === "false") &&
+            (edge === trueEdge || this._isEdgeSuccessBranch(edge) === true)
+         ) {
+            return false;
+         }
+         if (
+            (srcNode.forcedState === true || srcNode.forcedState === "true") &&
+            (edge === falseEdge || this._isEdgeSuccessBranch(edge) === false)
+         ) {
+            return false;
+         }
+      }
+      return true;
+   }
+
+   /**
+    * Set a preferred outgoing connection / route for a node.
+    * Packets departing from this node (via triggerPacket, autoSpawn, or cascading)
+    * will follow this route unless explicitly specified otherwise.
+    * @param {string} nodeId - Node ID (e.g. 'cassie_hhe')
+    * @param {string|Object|null} route - Target node ID (e.g. 'isFlagExist'), label ('normal'), color, or selector object
+    * @returns {Object|null} Matched connection edge, or null
+    */
+   setNodeRoute(nodeId, route) {
+      const node = this.nodes.find((n) => n.id === nodeId);
+      if (!node) return null;
+      node.activeRoute = route;
+      return route ? this._findEdgeBySelector(nodeId, route) : null;
+   }
+
+   /**
+    * Get currently configured active route for a node.
+    * @param {string} nodeId
+    * @returns {string|Object|null}
+    */
+   getNodeRoute(nodeId) {
+      const node = this.nodes.find((n) => n.id === nodeId);
+      return node ? node.activeRoute || null : null;
+   }
+
+   /**
+    * Clear configured active route for a node.
+    * @param {string} nodeId
+    */
+   clearNodeRoute(nodeId) {
+      return this.setNodeRoute(nodeId, null);
+   }
+
+   /**
     * Identify outgoing branches for a conditional node
     * @param {string} nodeId - ID of the conditional node
     */
@@ -489,37 +713,68 @@ class CinematicFlow {
 
    /**
     * Trigger an individual animated data packet along an edge.
+    * Allows selecting specific connection via targetId (node ID, label like 'normal'/'major', color, or selector object).
     * Enforces strict conditional branching when originating from a conditional node.
+    * @param {string|Object} sourceId - ID of origin node or config object { from, to, label, color }
+    * @param {string|Object} [targetId] - Destination node ID, connection label, color, or selector object
+    * @param {string} [colorOverride] - Custom packet color
+    * @param {Object} [options] - Options e.g. { cascade: true/false }
     */
-   triggerPacket(sourceId, targetId = null, colorOverride = null) {
+   triggerPacket(
+      sourceId,
+      targetId = null,
+      colorOverride = null,
+      options = {},
+   ) {
+      // Allow passing config object as first argument: flow.triggerPacket({ from: 'cassie_hhe', label: 'normal' })
+      if (typeof sourceId === "object" && sourceId !== null) {
+         const cfg = sourceId;
+         sourceId = cfg.source || cfg.from || cfg.id;
+         targetId =
+            cfg.target || cfg.to || cfg.label || cfg.color || cfg.route || targetId;
+         colorOverride = cfg.colorOverride || cfg.color || colorOverride;
+         options = Object.assign({}, cfg, options);
+      }
+
       let edge = null;
       if (targetId) {
-         edge = this.edges.find(
-            (e) => e.source === sourceId && e.target === targetId,
-         );
+         // Resolve by target node ID, label ('normal'), color, or object selector
+         edge = this._findEdgeBySelector(sourceId, targetId);
+         if (!edge) {
+            edge = this.edges.find(
+               (e) => e.source === sourceId && e.target === targetId,
+            );
+         }
       } else if (sourceId) {
          const srcNode = this.nodes.find((n) => n.id === sourceId);
-         if (srcNode && srcNode.type === "conditional") {
-            const { trueEdge, falseEdge, all } =
-               this._getConditionalEdges(sourceId);
-            const forced = srcNode.forcedState;
-            if (forced === true || forced === "true") {
-               edge = trueEdge;
-            } else if (forced === false || forced === "false") {
-               edge = falseEdge;
+         // Check if node has a configured activeRoute
+         if (srcNode && srcNode.activeRoute) {
+            edge = this._findEdgeBySelector(sourceId, srcNode.activeRoute);
+         }
+
+         if (!edge) {
+            if (srcNode && srcNode.type === "conditional") {
+               const { trueEdge, falseEdge, all } =
+                  this._getConditionalEdges(sourceId);
+               const forced = srcNode.forcedState;
+               if (forced === true || forced === "true") {
+                  edge = trueEdge;
+               } else if (forced === false || forced === "false") {
+                  edge = falseEdge;
+               } else {
+                  edge =
+                     Math.random() < 0.75
+                        ? trueEdge || falseEdge
+                        : falseEdge || trueEdge;
+               }
+               if (!edge && all.length > 0 && forced === "auto") {
+                  edge = all[0];
+               }
             } else {
-               edge =
-                  Math.random() < 0.75
-                     ? trueEdge || falseEdge
-                     : falseEdge || trueEdge;
-            }
-            if (!edge && all.length > 0 && forced === "auto") {
-               edge = all[0];
-            }
-         } else {
-            const outEdges = this.edges.filter((e) => e.source === sourceId);
-            if (outEdges.length > 0) {
-               edge = outEdges[Math.floor(Math.random() * outEdges.length)];
+               const outEdges = this.edges.filter((e) => e.source === sourceId);
+               if (outEdges.length > 0) {
+                  edge = outEdges[Math.floor(Math.random() * outEdges.length)];
+               }
             }
          }
       }
@@ -530,29 +785,24 @@ class CinematicFlow {
       if (!srcNode || !dstNode) return null;
 
       // STRICT CONDITIONAL BRANCH GUARD:
-      // If edge leaves a conditional node, strictly enforce its forcedState!
-      if (srcNode.type === "conditional") {
-         const { trueEdge, falseEdge } = this._getConditionalEdges(srcNode.id);
-         const forced = srcNode.forcedState;
-         if (
-            (forced === false || forced === "false") &&
-            (edge === trueEdge || this._isEdgeSuccessBranch(edge) === true)
-         ) {
-            // Strictly blocked: true branch forbidden when forced false!
-            return null;
-         }
-         if (
-            (forced === true || forced === "true") &&
-            (edge === falseEdge || this._isEdgeSuccessBranch(edge) === false)
-         ) {
-            // Strictly blocked: false branch forbidden when forced true!
-            return null;
-         }
+      if (!this._isEdgeAllowed(edge, srcNode)) {
+         return null;
+      }
+
+      // Guard against cascading packet explosion / flood
+      const maxPackets = this.options.maxPackets || 25;
+      if (this.packets.length >= maxPackets) {
+         return null;
       }
 
       const color = colorOverride || edge.color || "blue";
       const isRed =
          color === "red" || this._isEdgeSuccessBranch(edge) === false;
+
+      const cascade =
+         typeof options.cascade === "boolean"
+            ? options.cascade
+            : this.options.cascadePackets !== false;
 
       const pkt = {
          edge,
@@ -564,9 +814,106 @@ class CinematicFlow {
          colorKey: color,
          isFailover: isRed,
          trail: [],
+         cascade,
       };
       this.packets.push(pkt);
       return pkt;
+   }
+
+   /**
+    * Trigger a single step (1 hop only) without auto-forwarding further.
+    * @param {string} sourceId
+    * @param {string} [targetId]
+    * @param {string} [colorOverride]
+    */
+   stepPacket(sourceId, targetId = null, colorOverride = null) {
+      return this.triggerPacket(sourceId, targetId, colorOverride, {
+         cascade: false,
+      });
+   }
+
+   /**
+    * Returns all nodes that have at least one outgoing connection.
+    * @returns {Array<Object>} List of source nodes
+    */
+   getSourceNodes() {
+      const sourceIds = new Set(this.edges.map((e) => e.source));
+      return this.nodes.filter((n) => sourceIds.has(n.id));
+   }
+
+   // ==========================================
+   // Event System (Packet Arrival, Clicks, etc.)
+   // ==========================================
+
+   /**
+    * Register an event listener.
+    * Supported events:
+    *  - 'packetArrive': (targetNode, packet) => {}
+    *  - 'packetArrive:<nodeId>': (targetNode, packet) => {}
+    *  - 'nodeClick': (node) => {}
+    *  - 'conditionChange': ({ nodeId, node, state }) => {}
+    * @param {string} event
+    * @param {Function} handler
+    * @returns {CinematicFlow}
+    */
+   on(event, handler) {
+      if (!this._eventListeners[event]) {
+         this._eventListeners[event] = [];
+      }
+      this._eventListeners[event].push(handler);
+      return this;
+   }
+
+   /**
+    * Remove an event listener.
+    * @param {string} event
+    * @param {Function} handler
+    * @returns {CinematicFlow}
+    */
+   off(event, handler) {
+      if (!this._eventListeners[event]) return this;
+      this._eventListeners[event] = this._eventListeners[event].filter(
+         (h) => h !== handler,
+      );
+      return this;
+   }
+
+   /**
+    * Emit an event to all registered listeners.
+    * @param {string} event
+    * @param  {...any} args
+    */
+   emit(event, ...args) {
+      if (this._eventListeners[event]) {
+         this._eventListeners[event].forEach((handler) => {
+            try {
+               handler(...args);
+            } catch (err) {
+               console.error(`Error in event listener for "${event}":`, err);
+            }
+         });
+      }
+   }
+
+   /**
+    * Register a listener specifically for when a packet arrives at a certain node (e.g. 'threadA').
+    * @param {string} nodeId - Target node ID
+    * @param {Function} callback - (node, packet) => {}
+    */
+   onNodeArrival(nodeId, callback) {
+      return this.on(`packetArrive:${nodeId}`, callback);
+   }
+
+   /**
+    * Register a listener specifically for when a packet arrives at ANY thread node.
+    * @param {Function} callback - (threadNode, packet) => {}
+    */
+   onThreadArrival(callback) {
+      return this.on("packetArrive", (node, packet) => {
+         if (node.type === "thread") {
+            callback(node, packet);
+         }
+      });
    }
 
    /**
@@ -930,48 +1277,170 @@ class CinematicFlow {
    }
 
    /**
-    * Start auto spawning of packets along existing connections.
-    * Prioritizes root/ingress edges (e.g. input nodes or in-degree 0 nodes)
-    * and never initiates traffic on forbidden conditional branches.
+    * Internal helper to parse rest parameters / objects / strings into structured spawn targets:
+    * Array of { sourceId, routeSelector }
+    * Supports:
+    *  - toggleAutoSpawn('cassie_hhe', 'isFlagExist')
+    *  - toggleAutoSpawn('cassie_hhe', 'normal')
+    *  - toggleAutoSpawn('cassie_hhe', { label: 'normal' })
+    *  - toggleAutoSpawn({ from: 'cassie_hhe', to: 'isFlagExist' })
+    *  - toggleAutoSpawn({ from: 'cassie_hhe', label: 'normal' })
+    *  - toggleAutoSpawn('cassie_hhe->normal')
+    *  - toggleAutoSpawn('cassie_hhe:normal')
+    *  - toggleAutoSpawn('nodeA', 'nodeB') (multiple independent nodes)
+    *  - toggleAutoSpawn(['nodeA', 'nodeB'])
+    * @private
     */
-   startPacketSpawner() {
-      this.stopPacketSpawner();
+   _parseSpawnTargets(...args) {
+      if (args.length === 0) return [];
+
+      // Single object: { from, to } or { id, label }
+      if (
+         args.length === 1 &&
+         typeof args[0] === "object" &&
+         args[0] !== null &&
+         !Array.isArray(args[0])
+      ) {
+         const obj = args[0];
+         const sourceId = obj.from || obj.source || obj.id;
+         const routeSelector =
+            obj.to || obj.target || obj.label || obj.color || obj.route || null;
+         if (sourceId) {
+            return [{ sourceId: String(sourceId).trim(), routeSelector }];
+         }
+         return [];
+      }
+
+      // Two arguments: (sourceId, routeSelector)
+      if (
+         args.length === 2 &&
+         typeof args[0] === "string" &&
+         (typeof args[1] === "object" ||
+            (typeof args[1] === "string" &&
+               (!this.nodes.some((n) => n.id === args[1]) ||
+                  !this.edges.some((e) => e.source === args[1])) &&
+               this._findEdgeBySelector(args[0], args[1])))
+      ) {
+         return [
+            {
+               sourceId: args[0].trim(),
+               routeSelector: args[1],
+            },
+         ];
+      }
+
+      // Multiple or flattened args
+      const parsed = [];
+      const rawItems = args.flat(Infinity);
+      rawItems.forEach((item) => {
+         if (typeof item === "string") {
+            item.split(",").forEach((sub) => {
+               const s = sub.trim();
+               if (!s) return;
+               if (s.includes("->")) {
+                  const [src, tgt] = s.split("->").map((p) => p.trim());
+                  if (src) parsed.push({ sourceId: src, routeSelector: tgt || null });
+               } else if (s.includes(":") && !this.nodes.some((n) => n.id === s)) {
+                  const [src, tgt] = s.split(":").map((p) => p.trim());
+                  if (src) parsed.push({ sourceId: src, routeSelector: tgt || null });
+               } else {
+                  parsed.push({ sourceId: s, routeSelector: null });
+               }
+            });
+         } else if (typeof item === "object" && item !== null) {
+            const sourceId = item.from || item.source || item.id;
+            const routeSelector =
+               item.to || item.target || item.label || item.color || item.route || null;
+            if (sourceId) {
+               parsed.push({ sourceId: String(sourceId).trim(), routeSelector });
+            }
+         }
+      });
+      return parsed;
+   }
+
+   /**
+    * Internal helper to normalize rest parameters / arrays of node IDs into a clean array of strings.
+    * Kept for backward compatibility.
+    * @private
+    */
+   _normalizeNodeIds(...args) {
+      return this._parseSpawnTargets(...args).map((t) => t.sourceId);
+   }
+
+   /**
+    * Start auto spawning of packets along existing connections.
+    * If targets are provided, auto-spawning is scoped specifically to those source nodes and their chosen routes.
+    * Otherwise, prioritizes root/ingress edges across the whole diagram.
+    * Always respects conditional branch rules (forcedState).
+    * @param {Array<string|Object>|string|Object} [targets]
+    */
+   startPacketSpawner(targets = null) {
+      this.stopPacketSpawner(false);
+      if (targets) {
+         const parsed = this._parseSpawnTargets(targets);
+         if (parsed.length > 0) {
+            parsed.forEach(({ sourceId, routeSelector }) => {
+               this._autoSpawnNodes.add(sourceId);
+               if (routeSelector) {
+                  this._autoSpawnRoutes.set(sourceId, routeSelector);
+               }
+            });
+         }
+      }
+
       this._spawnerInterval = setInterval(() => {
          if (this.edges.length === 0) return;
 
-         // 1. Prioritize root / ingress edges (from 'input' nodes or nodes with 0 incoming edges)
-         let candidateEdges = this.edges.filter((e) => {
-            const src = this.nodes.find((n) => n.id === e.source);
-            if (!src) return false;
-            if (src.type === "input") return true;
-            const hasIncoming = this.edges.some(
-               (inE) => inE.target === e.source,
-            );
-            return !hasIncoming;
-         });
+         let candidateEdges = [];
 
-         // 2. If no root edges found (e.g. cyclic graph), pick edges that do not violate conditional forcedState
-         if (candidateEdges.length === 0) {
+         // 1. Scoped Mode: If specific node IDs are being tracked, only spawn from those nodes
+         if (this._autoSpawnNodes && this._autoSpawnNodes.size > 0) {
+            this._autoSpawnNodes.forEach((sourceId) => {
+               const src = this.nodes.find((n) => n.id === sourceId);
+               if (!src) return;
+
+               const routeSelector =
+                  this._autoSpawnRoutes.get(sourceId) || src.activeRoute || null;
+
+               if (routeSelector) {
+                  const specificEdge = this._findEdgeBySelector(
+                     sourceId,
+                     routeSelector,
+                  );
+                  if (specificEdge && this._isEdgeAllowed(specificEdge, src)) {
+                     candidateEdges.push(specificEdge);
+                     return;
+                  }
+               }
+
+               const outEdges = this.edges.filter((e) => {
+                  if (e.source !== sourceId) return false;
+                  return this._isEdgeAllowed(e, src);
+               });
+               candidateEdges.push(...outEdges);
+            });
+         } else {
+            // 2. Global Mode: Prioritize root / ingress edges (from 'input' nodes or nodes with 0 incoming edges)
             candidateEdges = this.edges.filter((e) => {
                const src = this.nodes.find((n) => n.id === e.source);
                if (!src) return false;
-               if (src.type === "conditional") {
-                  const { trueEdge, falseEdge } = this._getConditionalEdges(
-                     src.id,
-                  );
-                  if (
-                     src.forcedState === false &&
-                     (e === trueEdge || this._isEdgeSuccessBranch(e) === true)
-                  )
-                     return false;
-                  if (
-                     src.forcedState === true &&
-                     (e === falseEdge || this._isEdgeSuccessBranch(e) === false)
-                  )
-                     return false;
-               }
-               return true;
+               if (!this._isEdgeAllowed(e, src)) return false;
+               if (src.type === "input") return true;
+               const hasIncoming = this.edges.some(
+                  (inE) => inE.target === e.source,
+               );
+               return !hasIncoming;
             });
+
+            // If no root edges found (e.g. cyclic graph), pick edges that do not violate conditional forcedState
+            if (candidateEdges.length === 0) {
+               candidateEdges = this.edges.filter((e) => {
+                  const src = this.nodes.find((n) => n.id === e.source);
+                  if (!src) return false;
+                  return this._isEdgeAllowed(e, src);
+               });
+            }
          }
 
          if (candidateEdges.length > 0) {
@@ -988,12 +1457,233 @@ class CinematicFlow {
 
    /**
     * Stop auto spawning of packets.
+    * @param {boolean} [clearNodes=true] - Whether to clear the scoped auto-spawn nodes filter
     */
-   stopPacketSpawner() {
+   stopPacketSpawner(clearNodes = true) {
       if (this._spawnerInterval) {
          clearInterval(this._spawnerInterval);
          this._spawnerInterval = null;
       }
+      if (clearNodes) {
+         this._autoSpawnNodes.clear();
+         this._autoSpawnRoutes.clear();
+      }
+   }
+
+   /**
+    * Enable or disable auto packet spawner.
+    * If node IDs or route selectors are passed, enables or disables auto-spawning for those specific nodes/routes.
+    * @param {boolean} enabled - true for auto, false for manual
+    * @param {...(string|Object)} [args] - Optional node ID(s) or route configs
+    * @returns {boolean} current running state
+    */
+   setAutoSpawn(enabled, ...args) {
+      const parsedTargets = this._parseSpawnTargets(...args);
+      this.options.autoSpawnPackets = !!enabled;
+
+      if (!enabled) {
+         if (parsedTargets.length > 0) {
+            parsedTargets.forEach(({ sourceId }) => {
+               this._autoSpawnNodes.delete(sourceId);
+               this._autoSpawnRoutes.delete(sourceId);
+            });
+            if (this._autoSpawnNodes.size === 0) {
+               this.stopPacketSpawner(true);
+            }
+         } else {
+            this.stopPacketSpawner(true);
+         }
+      } else {
+         if (parsedTargets.length > 0) {
+            parsedTargets.forEach(({ sourceId, routeSelector }) => {
+               this._autoSpawnNodes.add(sourceId);
+               if (routeSelector) {
+                  this._autoSpawnRoutes.set(sourceId, routeSelector);
+               }
+            });
+            this.startPacketSpawner();
+         } else {
+            this._autoSpawnNodes.clear();
+            this._autoSpawnRoutes.clear();
+            this.startPacketSpawner();
+         }
+      }
+      return this.isAutoSpawnRunning();
+   }
+
+   /**
+    * Toggle auto packet spawner on/off.
+    * - If called with NO parameters: toggles global auto-spawner across root/ingress nodes.
+    * - If called WITH node ID(s) / routes: toggles auto-spawning specifically for those node(s) and connection(s).
+    *   - Can select connection by:
+    *       flow.toggleAutoSpawn('cassie_hhe', 'isFlagExist')
+    *       flow.toggleAutoSpawn('cassie_hhe', 'normal')
+    *       flow.toggleAutoSpawn('cassie_hhe', { label: 'normal' })
+    *       flow.toggleAutoSpawn({ from: 'cassie_hhe', label: 'normal' })
+    *       flow.toggleAutoSpawn('cassie_hhe->normal')
+    *   - If the node/route is already active: turns it off.
+    *   - If inactive or route changed: activates it with the selected connection and ensures spawner is running.
+    * @param {...(string|Object)} [args] - Optional node ID(s) or connection selector
+    * @returns {boolean} Whether spawner is now active
+    */
+   toggleAutoSpawn(...args) {
+      // 1. Global toggle when no arguments provided
+      if (args.length === 0) {
+         if (this.isAutoSpawnRunning()) {
+            this.setAutoSpawn(false);
+            return false;
+         } else {
+            this.setAutoSpawn(true);
+            return true;
+         }
+      }
+
+      const parsedTargets = this._parseSpawnTargets(...args);
+      if (parsedTargets.length === 0) return false;
+
+      const isRunning = this.isAutoSpawnRunning();
+      const allActiveWithSameRoute =
+         isRunning &&
+         this._autoSpawnNodes.size > 0 &&
+         parsedTargets.every(({ sourceId, routeSelector }) => {
+            if (!this._autoSpawnNodes.has(sourceId)) return false;
+            if (routeSelector) {
+               const current = this._autoSpawnRoutes.get(sourceId);
+               if (
+                  typeof routeSelector === "object" &&
+                  typeof current === "object"
+               ) {
+                  return JSON.stringify(routeSelector) === JSON.stringify(current);
+               }
+               return current === routeSelector;
+            }
+            return true;
+         });
+
+      if (allActiveWithSameRoute) {
+         // Turn OFF
+         parsedTargets.forEach(({ sourceId }) => {
+            this._autoSpawnNodes.delete(sourceId);
+            this._autoSpawnRoutes.delete(sourceId);
+         });
+         if (this._autoSpawnNodes.size === 0) {
+            this.stopPacketSpawner(true);
+            return false;
+         }
+         return true;
+      } else {
+         // Turn ON / Switch Route
+         parsedTargets.forEach(({ sourceId, routeSelector }) => {
+            this._autoSpawnNodes.add(sourceId);
+            if (routeSelector) {
+               this._autoSpawnRoutes.set(sourceId, routeSelector);
+            } else {
+               this._autoSpawnRoutes.delete(sourceId);
+            }
+         });
+         this.startPacketSpawner();
+         return true;
+      }
+   }
+
+   /**
+    * Check if auto spawner is currently active.
+    * If nodeId is provided (string or node object), checks if that specific node (and optional route) is currently auto-spawning.
+    * @param {string|Object} [nodeId]
+    * @param {string|Object} [routeSelector]
+    * @returns {boolean}
+    */
+   isAutoSpawnRunning(nodeId = null, routeSelector = null) {
+      if (nodeId && typeof nodeId === "object" && nodeId.id) {
+         nodeId = nodeId.id;
+      }
+      const isRunning =
+         this._spawnerInterval !== null && this._spawnerInterval !== undefined;
+      if (!isRunning) return false;
+      if (nodeId) {
+         if (this._autoSpawnNodes.size === 0) {
+            return this.edges.some((e) => e.source === nodeId);
+         }
+         if (!this._autoSpawnNodes.has(nodeId)) return false;
+         if (routeSelector) {
+            const current = this._autoSpawnRoutes.get(nodeId);
+            return current === routeSelector;
+         }
+         return true;
+      }
+      return isRunning;
+   }
+
+   /**
+    * Get auto-spawn status and route for a specific node, or all active nodes.
+    * Accepts string nodeId or node object.
+    * @param {string|Object} [nodeId]
+    * @returns {Object} { active: boolean, route: string|null, isGlobal: boolean }
+    */
+   getAutoSpawn(nodeId = null) {
+      if (nodeId && typeof nodeId === "object" && nodeId.id) {
+         nodeId = nodeId.id;
+      }
+      const isRunning = this.isAutoSpawnRunning();
+      if (!isRunning) {
+         return nodeId
+            ? { active: false, route: null, isGlobal: false }
+            : { active: false, isGlobal: false, nodes: [] };
+      }
+      if (nodeId) {
+         const active = this.isAutoSpawnRunning(nodeId);
+         const route = this._autoSpawnRoutes.get(nodeId) || null;
+         const isGlobal = this._autoSpawnNodes.size === 0;
+         return {
+            active,
+            route,
+            isGlobal,
+         };
+      }
+      return {
+         active: true,
+         isGlobal: this._autoSpawnNodes.size === 0,
+         nodes: this.getActiveAutoSpawnNodes(),
+      };
+   }
+
+   /**
+    * Get array of node IDs and their routes currently scoped for auto-spawning,
+    * or null if running globally across all root nodes.
+    * @returns {Array<Object>|null}
+    */
+   getActiveAutoSpawnNodes() {
+      if (!this.isAutoSpawnRunning()) return [];
+      if (this._autoSpawnNodes.size === 0) return null;
+      return Array.from(this._autoSpawnNodes).map((nodeId) => {
+         const route = this._autoSpawnRoutes.get(nodeId) || null;
+         return route ? { id: nodeId, route } : nodeId;
+      });
+   }
+
+   /**
+    * Manually trigger a packet from the first root/ingress node found
+    * (ideal for manual 'Shoot Packet' buttons without needing to know node IDs).
+    * @param {string} [colorOverride]
+    */
+   triggerIngress(colorOverride = null) {
+      let candidateEdges = this.edges.filter((e) => {
+         const src = this.nodes.find((n) => n.id === e.source);
+         if (!src) return false;
+         if (src.type === "input") return true;
+         const hasIncoming = this.edges.some((inE) => inE.target === e.source);
+         return !hasIncoming;
+      });
+
+      if (candidateEdges.length === 0) {
+         candidateEdges = this.edges;
+      }
+
+      if (candidateEdges.length > 0) {
+         const edge = candidateEdges[Math.floor(Math.random() * candidateEdges.length)];
+         return this.triggerPacket(edge.source, edge.target, colorOverride || edge.color);
+      }
+      return null;
    }
 
    /**
@@ -1072,12 +1762,16 @@ class CinematicFlow {
    }
 
    _resizeCanvas() {
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = Math.min(
+         window.devicePixelRatio || 1,
+         this.options.maxDpr || 1.5,
+      );
       const w = this.container.clientWidth || window.innerWidth;
       const h = this.container.clientHeight || window.innerHeight;
       this.canvas.width = w * dpr;
       this.canvas.height = h * dpr;
       this.ctx.scale(dpr, dpr);
+      this._gridPattern = null;
    }
 
    _worldToScreen(wx, wy) {
@@ -1096,6 +1790,13 @@ class CinematicFlow {
          x: this.camera.x + (sx - sw / 2) / this.camera.scale,
          y: this.camera.y + (sy - sh / 2) / this.camera.scale,
       };
+   }
+
+   _isFastMode() {
+      return (
+         this.options.performanceModeOnDrag !== false &&
+         (this.isDragging || this.draggedNode !== null)
+      );
    }
 
    _renderLoop() {
@@ -1136,15 +1837,61 @@ class CinematicFlow {
       this._animFrameId = requestAnimationFrame(this._renderLoop.bind(this));
    }
 
+   _createGridPattern() {
+      if (typeof document === "undefined" || !document.createElement) return null;
+      try {
+         const patternCanvas = document.createElement("canvas");
+         patternCanvas.width = 36;
+         patternCanvas.height = 36;
+         const pctx = patternCanvas.getContext("2d");
+         if (!pctx) return null;
+         pctx.fillStyle = this.options.gridColor || "rgba(30, 41, 59, 0.45)";
+         pctx.beginPath();
+         pctx.arc(18, 18, 1.15, 0, Math.PI * 2);
+         pctx.fill();
+         this._gridPattern = this.ctx.createPattern(patternCanvas, "repeat");
+         return this._gridPattern;
+      } catch (e) {
+         return null;
+      }
+   }
+
    _drawGrid(sw, sh) {
       const ctx = this.ctx;
-      const gridSize = 36 * this.camera.scale;
-      const offsetX = (sw / 2 - this.camera.x * this.camera.scale) % gridSize;
-      const offsetY = (sh / 2 - this.camera.y * this.camera.scale) % gridSize;
+      if (!ctx) return;
 
-      ctx.fillStyle = this.options.gridColor;
-      for (let x = offsetX; x < sw; x += gridSize) {
-         for (let y = offsetY; y < sh; y += gridSize) {
+      if (!this._gridPattern) {
+         this._createGridPattern();
+      }
+
+      const scale = this.camera.scale;
+      const gridSize = 36 * scale;
+      const offsetX = sw / 2 - this.camera.x * scale;
+      const offsetY = sh / 2 - this.camera.y * scale;
+
+      // Fast path: GPU pattern tile with DOMMatrix transform (1 single fillRect call)
+      if (
+         this._gridPattern &&
+         this._gridPattern.setTransform &&
+         typeof DOMMatrix !== "undefined"
+      ) {
+         ctx.save();
+         const matrix = new DOMMatrix();
+         matrix.translateSelf(offsetX, offsetY);
+         matrix.scaleSelf(scale, scale);
+         this._gridPattern.setTransform(matrix);
+         ctx.fillStyle = this._gridPattern;
+         ctx.fillRect(0, 0, sw, sh);
+         ctx.restore();
+         return;
+      }
+
+      // Fallback path: Loop only when DOMMatrix or Pattern is unavailable
+      const startX = offsetX % gridSize;
+      const startY = offsetY % gridSize;
+      ctx.fillStyle = this.options.gridColor || "rgba(30, 41, 59, 0.45)";
+      for (let x = startX; x < sw; x += gridSize) {
+         for (let y = startY; y < sh; y += gridSize) {
             ctx.beginPath();
             ctx.arc(x, y, 1.15, 0, Math.PI * 2);
             ctx.fill();
@@ -1155,6 +1902,8 @@ class CinematicFlow {
    _drawGroups() {
       if (!this.groups || this.groups.length === 0) return;
       const ctx = this.ctx;
+      const sw = this.container.clientWidth || window.innerWidth;
+      const sh = this.container.clientHeight || window.innerHeight;
 
       this.groups.forEach((g) => {
          const gNodes = this.nodes.filter(
@@ -1181,6 +1930,11 @@ class CinematicFlow {
          const x = p1.x - pad;
          const y = p1.y - pad;
 
+         // Viewport Culling: Skip rendering if group box is off-screen
+         if (x + w < -50 || x > sw + 50 || y + h < -50 || y > sh + 50) {
+            return;
+         }
+
          const colorData = this.COLORS[g.color] || this.COLORS.cyan;
 
          // Group Background Tint
@@ -1199,7 +1953,7 @@ class CinematicFlow {
          // Group Header Label
          if (g.name) {
             ctx.fillStyle = colorData.glow;
-            ctx.font = `bold ${Math.max(10, 11 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+            ctx.font = `bold ${Math.max(1, 11 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
             ctx.fillText(
                g.name.toUpperCase(),
                x + 14 * this.camera.scale,
@@ -1296,9 +2050,23 @@ class CinematicFlow {
 
    _drawEdges() {
       const ctx = this.ctx;
+      const sw = this.container.clientWidth || window.innerWidth;
+      const sh = this.container.clientHeight || window.innerHeight;
+      const fastMode = this._isFastMode();
+
       this.edges.forEach((edge) => {
          const pts = this._getEdgeEndpoints(edge);
          if (!pts) return;
+
+         // Viewport Bounding Box Culling: Skip edges entirely outside the screen
+         const minX = Math.min(pts.p1.x, pts.p2.x, pts.cp1.x, pts.cp2.x);
+         const maxX = Math.max(pts.p1.x, pts.p2.x, pts.cp1.x, pts.cp2.x);
+         const minY = Math.min(pts.p1.y, pts.p2.y, pts.cp1.y, pts.cp2.y);
+         const maxY = Math.max(pts.p1.y, pts.p2.y, pts.cp1.y, pts.cp2.y);
+
+         if (maxX < -50 || minX > sw + 50 || maxY < -50 || minY > sh + 50) {
+            return;
+         }
 
          const colorData = this.COLORS[edge.color] || this.COLORS.blue;
 
@@ -1316,18 +2084,20 @@ class CinematicFlow {
 
          // Line style
          ctx.strokeStyle = colorData.main;
-         ctx.globalAlpha = 0.38;
+         ctx.globalAlpha = fastMode ? 0.6 : 0.38;
          ctx.lineWidth = Math.max(1.8, 2.4 * this.camera.scale);
          ctx.stroke();
 
-         // Subtle dashed neon core
-         ctx.strokeStyle = colorData.glow;
-         ctx.globalAlpha = 0.85;
-         ctx.lineWidth = Math.max(1.0, 1.2 * this.camera.scale);
-         ctx.setLineDash([4 * this.camera.scale, 4 * this.camera.scale]);
-         ctx.stroke();
-         ctx.setLineDash([]);
-         ctx.globalAlpha = 1.0;
+         // Subtle dashed neon core (skip heavy bezier dash subdividing during fastMode/drag)
+         if (!fastMode) {
+            ctx.strokeStyle = colorData.glow;
+            ctx.globalAlpha = 0.85;
+            ctx.lineWidth = Math.max(1.0, 1.2 * this.camera.scale);
+            ctx.setLineDash([4 * this.camera.scale, 4 * this.camera.scale]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.globalAlpha = 1.0;
+         }
 
          // Connector Port Pin at Source
          ctx.beginPath();
@@ -1363,7 +2133,8 @@ class CinematicFlow {
 
    _drawEdgeLabel(x, y, text, colorData) {
       const ctx = this.ctx;
-      const fontSize = Math.max(8, 10 * this.camera.scale);
+      const fontSize = Math.max(1, 10 * this.camera.scale);
+      if (fontSize < 2.5) return; // Skip microscopic text when zoomed way out
       ctx.font = `600 ${fontSize}px 'JetBrains Mono', monospace`;
       const tw = ctx.measureText(text).width;
       const padX = 6 * this.camera.scale;
@@ -1415,6 +2186,8 @@ class CinematicFlow {
 
          // Render glowing trail
          const colorData = this.COLORS[pkt.colorKey] || this.COLORS.blue;
+         const fastMode = this._isFastMode();
+
          for (let t = 0; t < pkt.trail.length; t++) {
             const tp = pkt.trail[t];
             const alpha = (t + 1) / pkt.trail.length;
@@ -1428,8 +2201,12 @@ class CinematicFlow {
             );
             ctx.fillStyle = colorData.glow;
             ctx.globalAlpha = alpha;
-            ctx.shadowBlur = 12 * this.camera.scale;
-            ctx.shadowColor = colorData.main;
+            if (!fastMode && t === pkt.trail.length - 1) {
+               ctx.shadowBlur = 10 * this.camera.scale;
+               ctx.shadowColor = colorData.main;
+            } else {
+               ctx.shadowBlur = 0;
+            }
             ctx.fill();
          }
          ctx.shadowBlur = 0;
@@ -1448,57 +2225,129 @@ class CinematicFlow {
             }
             this.stats.latency = 12 + Math.floor(Math.random() * 15);
 
-            // Forward propagation & branch routing
-            if (pkt.dst.type === "conditional") {
-               // Strict conditional routing
-               setTimeout(() => {
-                  const condNode = pkt.dst;
-                  const { trueEdge, falseEdge, all } =
-                     this._getConditionalEdges(condNode.id);
-                  let chosenEdge = null;
-                  const forced = condNode.forcedState;
+            // Emit arrival events
+            this.emit("packetArrive", pkt.dst, pkt);
+            this.emit("packetArrive:" + pkt.dst.id, pkt.dst, pkt);
+            if (pkt.dst.type === "thread") {
+               this.emit("threadArrive", pkt.dst, pkt);
+               this.emit("threadArrive:" + pkt.dst.id, pkt.dst, pkt);
+            }
 
-                  if (forced === true || forced === "true") {
-                     chosenEdge = trueEdge;
-                  } else if (forced === false || forced === "false") {
-                     chosenEdge = falseEdge;
-                  } else {
-                     // Auto / Random mode (75% true, 25% false)
-                     const isSuccess = Math.random() < 0.75;
-                     chosenEdge = isSuccess
-                        ? trueEdge || falseEdge
-                        : falseEdge || trueEdge;
-                  }
+            // Direct node arrival callback if defined on node
+            if (typeof pkt.dst.onArrival === "function") {
+               try {
+                  pkt.dst.onArrival(pkt.dst, pkt);
+               } catch (err) {
+                  console.error(
+                     `Error in onArrival callback for node "${pkt.dst.id}":`,
+                     err,
+                  );
+               }
+            }
 
-                  if (!chosenEdge && all.length > 0 && forced === "auto") {
-                     chosenEdge = all[0];
-                  }
+            // Optional arrival callback via constructor options
+            if (typeof this.options.onPacketArrive === "function") {
+               try {
+                  this.options.onPacketArrive(pkt.dst, pkt);
+               } catch (err) {
+                  console.error("Error in options.onPacketArrive:", err);
+               }
+            }
 
-                  if (chosenEdge) {
-                     this.triggerPacket(
-                        chosenEdge.source,
-                        chosenEdge.target,
-                        chosenEdge.color,
+            // Dispatch DOM CustomEvent on container (if element)
+            if (
+               this.container &&
+               typeof this.container.dispatchEvent === "function"
+            ) {
+               try {
+                  this.container.dispatchEvent(
+                     new CustomEvent("packet-arrive", {
+                        detail: { node: pkt.dst, packet: pkt },
+                        bubbles: true,
+                     }),
+                  );
+                  if (pkt.dst.type === "thread") {
+                     this.container.dispatchEvent(
+                        new CustomEvent("thread-arrive", {
+                           detail: { node: pkt.dst, packet: pkt },
+                           bubbles: true,
+                        }),
                      );
                   }
-               }, 140);
-            } else if (pkt.dst.type !== "output") {
-               // Forward cascade for normal process nodes (square, thread, database, input)
-               const outEdges = this.edges.filter(
-                  (e) => e.source === pkt.dst.id,
-               );
-               if (outEdges.length > 0) {
+               } catch (e) {}
+            }
+
+            // Forward propagation & branch routing (only if pkt.cascade !== false and node does not pause flow)
+            const shouldCascade =
+               pkt.cascade !== false &&
+               pkt.dst.autoForward !== false &&
+               pkt.dst.pauseFlow !== true;
+
+            if (shouldCascade) {
+               if (pkt.dst.type === "conditional") {
+                  // Strict conditional routing
                   setTimeout(() => {
-                     const nextEdge =
-                        outEdges[Math.floor(Math.random() * outEdges.length)];
-                     if (nextEdge) {
+                     const condNode = pkt.dst;
+                     const { trueEdge, falseEdge, all } =
+                        this._getConditionalEdges(condNode.id);
+                     let chosenEdge = null;
+                     const forced = condNode.forcedState;
+
+                     if (forced === true || forced === "true") {
+                        chosenEdge = trueEdge;
+                     } else if (forced === false || forced === "false") {
+                        chosenEdge = falseEdge;
+                     } else {
+                        // Auto / Random mode (75% true, 25% false)
+                        const isSuccess = Math.random() < 0.75;
+                        chosenEdge = isSuccess
+                           ? trueEdge || falseEdge
+                           : falseEdge || trueEdge;
+                     }
+
+                     if (!chosenEdge && all.length > 0 && forced === "auto") {
+                        chosenEdge = all[0];
+                     }
+
+                     if (chosenEdge) {
                         this.triggerPacket(
-                           nextEdge.source,
-                           nextEdge.target,
-                           nextEdge.color,
+                           chosenEdge.source,
+                           chosenEdge.target,
+                           chosenEdge.color,
+                           { cascade: pkt.cascade },
                         );
                      }
-                  }, 90);
+                  }, 140);
+               } else if (pkt.dst.type !== "output") {
+                  // Forward cascade for normal process nodes (square, thread, database, input)
+                  const outEdges = this.edges.filter(
+                     (e) => e.source === pkt.dst.id,
+                  );
+                  if (outEdges.length > 0) {
+                     setTimeout(() => {
+                        let nextEdge = null;
+                        if (pkt.dst.activeRoute) {
+                           nextEdge = this._findEdgeBySelector(
+                              pkt.dst.id,
+                              pkt.dst.activeRoute,
+                           );
+                        }
+                        if (!nextEdge) {
+                           nextEdge =
+                              outEdges[
+                                 Math.floor(Math.random() * outEdges.length)
+                              ];
+                        }
+                        if (nextEdge) {
+                           this.triggerPacket(
+                              nextEdge.source,
+                              nextEdge.target,
+                              nextEdge.color,
+                              { cascade: pkt.cascade },
+                           );
+                        }
+                     }, 90);
+                  }
                }
             }
 
@@ -1513,6 +2362,10 @@ class CinematicFlow {
    }
 
    _drawNodes() {
+      const sw = this.container.clientWidth || window.innerWidth;
+      const sh = this.container.clientHeight || window.innerHeight;
+      const margin = 70 * this.camera.scale;
+
       this.nodes.forEach((node) => {
          // Spawn expand animation
          if (node.spawnAnim !== undefined && node.spawnAnim < 1.0) {
@@ -1524,6 +2377,21 @@ class CinematicFlow {
          const pos = this._worldToScreen(node.x, node.y);
          const w = node.width * this.camera.scale * scaleMultiplier;
          const h = node.height * this.camera.scale * scaleMultiplier;
+
+         // Always decay pulse even if off-screen
+         if (node.pulse > 0) {
+            node.pulse = Math.max(0, node.pulse - 0.04);
+         }
+
+         // Viewport Culling: Skip rendering if completely off-screen
+         if (
+            pos.x + w < -margin ||
+            pos.x > sw + margin ||
+            pos.y + h < -margin ||
+            pos.y > sh + margin
+         ) {
+            return;
+         }
 
          const colorData = this.COLORS[node.color] || this.COLORS.blue;
 
@@ -1548,11 +2416,6 @@ class CinematicFlow {
                this._drawSquareNode(node, pos, w, h, colorData);
                break;
          }
-
-         // Decay pulse
-         if (node.pulse > 0) {
-            node.pulse = Math.max(0, node.pulse - 0.04);
-         }
       });
    }
 
@@ -1560,17 +2423,18 @@ class CinematicFlow {
    _drawSquareNode(node, pos, w, h, colorData) {
       const ctx = this.ctx;
       const r = 6 * this.camera.scale;
+      const fastMode = this._isFastMode();
 
       // Outer glow on packet hit
-      if (node.pulse > 0) {
+      if (node.pulse > 0 && !fastMode) {
          ctx.shadowBlur = 18 * node.pulse * this.camera.scale;
          ctx.shadowColor = colorData.glow;
          ctx.strokeStyle = colorData.glow;
          ctx.lineWidth = 2.5 * this.camera.scale;
       } else {
          ctx.shadowBlur = 0;
-         ctx.strokeStyle = "#1e293b";
-         ctx.lineWidth = 1.5 * this.camera.scale;
+         ctx.strokeStyle = node.pulse > 0 ? colorData.glow : "#1e293b";
+         ctx.lineWidth = (node.pulse > 0 ? 2 : 1.5) * this.camera.scale;
       }
 
       // Card background
@@ -1594,7 +2458,7 @@ class CinematicFlow {
 
       // Type Badge
       ctx.fillStyle = colorData.main;
-      ctx.font = `700 ${Math.max(7, 8.5 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `700 ${Math.max(1, 8.5 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          "PROCESS",
          pos.x + 12 * this.camera.scale,
@@ -1603,7 +2467,7 @@ class CinematicFlow {
 
       // Node Title
       ctx.fillStyle = "#f1f5f9";
-      ctx.font = `600 ${Math.max(9, 12 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `600 ${Math.max(1, 12 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       ctx.fillText(
          node.label,
          pos.x + 12 * this.camera.scale,
@@ -1612,7 +2476,7 @@ class CinematicFlow {
 
       // Sublabel
       ctx.fillStyle = "#64748b";
-      ctx.font = `500 ${Math.max(7, 9 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `500 ${Math.max(1, 9 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          node.sublabel || "STANDARD NODE",
          pos.x + 12 * this.camera.scale,
@@ -1625,9 +2489,10 @@ class CinematicFlow {
       const ctx = this.ctx;
       const cx = pos.x + w / 2;
       const cy = pos.y + h / 2;
+      const fastMode = this._isFastMode();
 
       // Glowing diamond frame
-      if (node.pulse > 0) {
+      if (node.pulse > 0 && !fastMode) {
          ctx.shadowBlur = 22 * node.pulse * this.camera.scale;
          ctx.shadowColor = colorData.glow;
          ctx.strokeStyle = colorData.glow;
@@ -1638,7 +2503,9 @@ class CinematicFlow {
                ? this.COLORS.green.main
                : node.forcedState === false
                  ? this.COLORS.red.main
-                 : "#334155";
+                 : node.pulse > 0
+                   ? colorData.glow
+                   : "#334155";
       }
 
       ctx.fillStyle = "#070d19";
@@ -1659,21 +2526,21 @@ class CinematicFlow {
       ctx.textAlign = "center";
       if (node.forcedState === true) {
          ctx.fillStyle = this.COLORS.green.glow;
-         ctx.font = `bold ${Math.max(7.5, 9 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+         ctx.font = `bold ${Math.max(1, 9 * this.camera.scale)}px 'JetBrains Mono', monospace`;
          ctx.fillText("COND", cx, pos.y + 16 * this.camera.scale);
       } else if (node.forcedState === false) {
          ctx.fillStyle = this.COLORS.red.glow;
-         ctx.font = `bold ${Math.max(7.5, 9 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+         ctx.font = `bold ${Math.max(1, 9 * this.camera.scale)}px 'JetBrains Mono', monospace`;
          ctx.fillText("COND", cx, pos.y + 16 * this.camera.scale);
       } else {
          ctx.fillStyle = colorData.main;
-         ctx.font = `bold ${Math.max(7.5, 9.5 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+         ctx.font = `bold ${Math.max(1, 9.5 * this.camera.scale)}px 'JetBrains Mono', monospace`;
          ctx.fillText("COND", cx, pos.y + 16 * this.camera.scale);
       }
 
       // Condition Text
       ctx.fillStyle = "#f8fafc";
-      ctx.font = `600 ${Math.max(8.5, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `600 ${Math.max(1, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       ctx.fillText(node.label, cx, cy + 2 * this.camera.scale);
 
       // Subtitle status (forced state or custom sublabel)
@@ -1683,7 +2550,7 @@ class CinematicFlow {
             : node.forcedState === false
               ? this.COLORS.red.text
               : "#64748b";
-      ctx.font = `500 ${Math.max(6.5, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `500 ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       const stateSubtitle =
          node.forcedState === true
             ? "● ALWAYS TRUE"
@@ -1734,14 +2601,15 @@ class CinematicFlow {
    _drawInputNode(node, pos, w, h, colorData) {
       const ctx = this.ctx;
       const r = h / 2;
+      const fastMode = this._isFastMode();
 
-      if (node.pulse > 0) {
+      if (node.pulse > 0 && !fastMode) {
          ctx.shadowBlur = 20 * node.pulse * this.camera.scale;
          ctx.shadowColor = colorData.glow;
          ctx.strokeStyle = colorData.glow;
       } else {
          ctx.shadowBlur = 0;
-         ctx.strokeStyle = "#0284c7";
+         ctx.strokeStyle = node.pulse > 0 ? colorData.glow : "#0284c7";
       }
 
       // Pill container
@@ -1766,7 +2634,7 @@ class CinematicFlow {
 
       // Ingress Tag
       ctx.fillStyle = colorData.main;
-      ctx.font = `bold ${Math.max(7, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `bold ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          "INPUT",
          pos.x + 40 * this.camera.scale,
@@ -1775,7 +2643,7 @@ class CinematicFlow {
 
       // Ingress Title
       ctx.fillStyle = "#f1f5f9";
-      ctx.font = `600 ${Math.max(8.5, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `600 ${Math.max(1, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       ctx.fillText(
          node.label,
          pos.x + 40 * this.camera.scale,
@@ -1784,7 +2652,7 @@ class CinematicFlow {
 
       // Sublabel
       ctx.fillStyle = "#64748b";
-      ctx.font = `500 ${Math.max(7, 8.5 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `500 ${Math.max(1, 8.5 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          node.sublabel || "PAYLOAD ENTRY",
          pos.x + 40 * this.camera.scale,
@@ -1796,14 +2664,15 @@ class CinematicFlow {
    _drawOutputNode(node, pos, w, h, colorData) {
       const ctx = this.ctx;
       const r = 8 * this.camera.scale;
+      const fastMode = this._isFastMode();
 
-      if (node.pulse > 0) {
+      if (node.pulse > 0 && !fastMode) {
          ctx.shadowBlur = 20 * node.pulse * this.camera.scale;
          ctx.shadowColor = colorData.glow;
          ctx.strokeStyle = colorData.glow;
       } else {
          ctx.shadowBlur = 0;
-         ctx.strokeStyle = "#059669";
+         ctx.strokeStyle = node.pulse > 0 ? colorData.glow : "#059669";
       }
 
       // Terminal Container
@@ -1824,7 +2693,7 @@ class CinematicFlow {
 
       // Output Tag
       ctx.fillStyle = colorData.main;
-      ctx.font = `bold ${Math.max(7, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `bold ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          "OUTPUT",
          pos.x + 14 * this.camera.scale,
@@ -1833,7 +2702,7 @@ class CinematicFlow {
 
       // Output Title
       ctx.fillStyle = "#f1f5f9";
-      ctx.font = `600 ${Math.max(8.5, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `600 ${Math.max(1, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       ctx.fillText(
          node.label,
          pos.x + 14 * this.camera.scale,
@@ -1842,7 +2711,7 @@ class CinematicFlow {
 
       // Sublabel
       ctx.fillStyle = "#64748b";
-      ctx.font = `500 ${Math.max(7, 8.5 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `500 ${Math.max(1, 8.5 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          node.sublabel || "CLIENT RESPONSE",
          pos.x + 14 * this.camera.scale,
@@ -1859,15 +2728,16 @@ class CinematicFlow {
       const topY = pos.y + ry;
       const bottomY = pos.y + h - ry;
       const bodyHeight = bottomY - topY;
+      const fastMode = this._isFastMode();
 
-      if (node.pulse > 0) {
+      if (node.pulse > 0 && !fastMode) {
          ctx.shadowBlur = 22 * node.pulse * this.camera.scale;
          ctx.shadowColor = colorData.glow;
          ctx.strokeStyle = colorData.glow;
          ctx.lineWidth = 2.2 * this.camera.scale;
       } else {
          ctx.shadowBlur = 0;
-         ctx.strokeStyle = "#0284c7";
+         ctx.strokeStyle = node.pulse > 0 ? colorData.glow : "#0284c7";
          ctx.lineWidth = 1.6 * this.camera.scale;
       }
 
@@ -1912,16 +2782,18 @@ class CinematicFlow {
       ctx.beginPath();
       ctx.arc(ledX, ledY, 3.5 * this.camera.scale, 0, Math.PI * 2);
       ctx.fillStyle = isActivity ? colorData.glow : "#1e3a5f";
-      if (isActivity) {
+      if (isActivity && !fastMode) {
          ctx.shadowBlur = 8 * this.camera.scale;
          ctx.shadowColor = colorData.glow;
+      } else {
+         ctx.shadowBlur = 0;
       }
       ctx.fill();
       ctx.shadowBlur = 0;
 
       // 5. Database Type Tag
       ctx.fillStyle = colorData.main;
-      ctx.font = `bold ${Math.max(7, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `bold ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          "DB · STORAGE",
          pos.x + 28 * this.camera.scale,
@@ -1932,7 +2804,7 @@ class CinematicFlow {
       ctx.fillStyle = "#f1f5f9";
       const maxTextWidth = w - 36 * this.camera.scale;
       let label = node.label;
-      ctx.font = `600 ${Math.max(8.5, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `600 ${Math.max(1, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       if (ctx.measureText(label).width > maxTextWidth) {
          while (
             label.length > 4 &&
@@ -1950,7 +2822,7 @@ class CinematicFlow {
 
       // 7. Sublabel / IOPS Metric
       ctx.fillStyle = "#94a3b8";
-      ctx.font = `500 ${Math.max(7, 8 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `500 ${Math.max(1, 8 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       const subText = node.sublabel || `IOPS: ${node.metrics.iops || "12.4k"}`;
       ctx.fillText(
          subText,
@@ -1963,10 +2835,15 @@ class CinematicFlow {
    _drawThreadNode(node, pos, w, h, colorData) {
       const ctx = this.ctx;
       const r = 8 * this.camera.scale;
+      const fastMode = this._isFastMode();
 
       // Dynamic thread aura
-      ctx.shadowBlur = (12 + node.pulse * 18) * this.camera.scale;
-      ctx.shadowColor = colorData.main;
+      if (!fastMode) {
+         ctx.shadowBlur = (12 + node.pulse * 18) * this.camera.scale;
+         ctx.shadowColor = colorData.main;
+      } else {
+         ctx.shadowBlur = 0;
+      }
 
       // Thread Container
       ctx.fillStyle = "#081711";
@@ -1996,7 +2873,7 @@ class CinematicFlow {
 
       // Thread Badge
       ctx.fillStyle = colorData.main;
-      ctx.font = `bold ${Math.max(7, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `bold ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          "THREAD · ACTIVE",
          pos.x + 32 * this.camera.scale,
@@ -2005,7 +2882,7 @@ class CinematicFlow {
 
       // Thread Title
       ctx.fillStyle = "#f1f5f9";
-      ctx.font = `600 ${Math.max(8.5, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
+      ctx.font = `600 ${Math.max(1, 11 * this.camera.scale)}px 'JetBrains Mono', monospace`;
       ctx.fillText(
          node.label,
          pos.x + 32 * this.camera.scale,
@@ -2029,7 +2906,7 @@ class CinematicFlow {
 
       // Sublabel
       ctx.fillStyle = "#64748b";
-      ctx.font = `500 ${Math.max(6.5, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
+      ctx.font = `500 ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       ctx.fillText(
          node.sublabel || "WORKER TASK",
          pos.x + 32 * this.camera.scale,
@@ -2129,6 +3006,8 @@ class CinematicFlow {
             const dy = (e.clientY - this.lastMousePos.y) / this.camera.scale;
             this.camera.targetX -= dx;
             this.camera.targetY -= dy;
+            this.camera.x = this.camera.targetX;
+            this.camera.y = this.camera.targetY;
             this.lastMousePos = { x: e.clientX, y: e.clientY };
          }
 
@@ -2271,13 +3150,39 @@ if (
    !customElements.get("cinematic-flow")
 ) {
    class CinematicFlowElement extends HTMLElement {
+      constructor() {
+         super();
+         this._pendingListeners = [];
+      }
+
       connectedCallback() {
          // Wait for children to parse
          setTimeout(() => {
+            const isManual =
+               this.hasAttribute("manual") ||
+               this.getAttribute("auto") === "false" ||
+               this.getAttribute("autospawn") === "false";
+            const interval = parseInt(
+               this.getAttribute("interval") ||
+                  this.getAttribute("interval-ms") ||
+                  320,
+               10,
+            );
+
             this.flow = new CinematicFlow(this, {
                theme: this.getAttribute("theme") || "cyberpunk",
                soundEnabled: this.hasAttribute("sound"),
+               autoSpawnPackets: !isManual,
+               packetIntervalMs: isNaN(interval) ? 320 : interval,
             });
+
+            // Replay any pending listeners registered before connectedCallback
+            if (this._pendingListeners && this._pendingListeners.length > 0) {
+               this._pendingListeners.forEach(([event, handler]) => {
+                  this.flow.on(event, handler);
+               });
+               this._pendingListeners = [];
+            }
 
             // Parse child <flow-node> tags
             const nodeEls = this.querySelectorAll("flow-node");
@@ -2327,6 +3232,35 @@ if (
       }
 
       // Delegate conditional controls to underlying CinematicFlow instance
+      on(event, handler) {
+         if (this.flow) {
+            this.flow.on(event, handler);
+         } else {
+            if (!this._pendingListeners) this._pendingListeners = [];
+            this._pendingListeners.push([event, handler]);
+         }
+         return this;
+      }
+
+      off(event, handler) {
+         if (this.flow) {
+            this.flow.off(event, handler);
+         } else if (this._pendingListeners) {
+            this._pendingListeners = this._pendingListeners.filter(
+               ([e, h]) => !(e === event && h === handler),
+            );
+         }
+         return this;
+      }
+
+      onNodeArrival(nodeId, callback) {
+         return this.on(`packetArrive:${nodeId}`, callback);
+      }
+
+      onThreadArrival(callback) {
+         return this.on("threadArrive", callback);
+      }
+
       getConditionNodes() {
          return this.flow ? this.flow.getConditionNodes() : [];
       }
@@ -2350,6 +3284,68 @@ if (
       triggerConditionSimulation(nodeId, forcedOverride = null) {
          if (this.flow)
             this.flow.triggerConditionSimulation(nodeId, forcedOverride);
+      }
+
+      setNodeRoute(nodeId, route) {
+         return this.flow ? this.flow.setNodeRoute(nodeId, route) : null;
+      }
+
+      getNodeRoute(nodeId) {
+         return this.flow ? this.flow.getNodeRoute(nodeId) : null;
+      }
+
+      clearNodeRoute(nodeId) {
+         return this.flow ? this.flow.clearNodeRoute(nodeId) : null;
+      }
+
+      triggerPacket(sourceId, targetId = null, colorOverride = null, options = {}) {
+         return this.flow
+            ? this.flow.triggerPacket(sourceId, targetId, colorOverride, options)
+            : null;
+      }
+
+      stepPacket(sourceId, targetId = null, colorOverride = null) {
+         return this.flow
+            ? this.flow.stepPacket(sourceId, targetId, colorOverride)
+            : null;
+      }
+
+      getSourceNodes() {
+         return this.flow ? this.flow.getSourceNodes() : [];
+      }
+
+      triggerIngress(colorOverride = null) {
+         return this.flow ? this.flow.triggerIngress(colorOverride) : null;
+      }
+
+      setAutoSpawn(enabled, ...args) {
+         return this.flow ? this.flow.setAutoSpawn(enabled, ...args) : false;
+      }
+
+      toggleAutoSpawn(...args) {
+         return this.flow ? this.flow.toggleAutoSpawn(...args) : false;
+      }
+
+      isAutoSpawnRunning(nodeId = null, routeSelector = null) {
+         return this.flow ? this.flow.isAutoSpawnRunning(nodeId, routeSelector) : false;
+      }
+
+      getAutoSpawn(nodeId = null) {
+         return this.flow
+            ? this.flow.getAutoSpawn(nodeId)
+            : { active: false, route: null, isGlobal: false };
+      }
+
+      getActiveAutoSpawnNodes() {
+         return this.flow ? this.flow.getActiveAutoSpawnNodes() : [];
+      }
+
+      startPacketSpawner(nodeIds = null) {
+         if (this.flow) this.flow.startPacketSpawner(nodeIds);
+      }
+
+      stopPacketSpawner(clearNodes = true) {
+         if (this.flow) this.flow.stopPacketSpawner(clearNodes);
       }
 
       disconnectedCallback() {
