@@ -447,14 +447,24 @@ Returns array of all node IDs currently scoped for auto-spawning.
 
 ### Conditional & Decision Routing
 
-#### `flow.setConditionState(nodeId, state)`
+#### `flow.setConditionState(nodeId, state, options)`
 Controls the evaluated path of a conditional diamond node:
 - `true`: Always route along the `TRUE` edge (Green right exit).
 - `false`: Always route along the `FALSE` edge (Red bottom exit).
 - `"auto"`: Evaluates dynamically based on incoming packet payload / randomness.
 
+**Graceful In-Flight Handling (Default)**:
+- Secara default, packet yang sudah terlanjur meluncur di jalur lama **tetap dibiarkan berjalan sampai selesai ke node tujuan** (`purgeInFlight: false`). Hanya packet baru yang akan mengikuti state baru.
+- Jika Anda secara eksplisit ingin langsung memusnahkan packet yang sedang meluncur, tambahkan opsi `{ purgeInFlight: true }`:
+
 ```javascript
-flow.setConditionState("valcond", false); // Force failure path
+// 1. Default (Graceful): packet yang sedang jalan tidak akan hilang
+flow.setConditionState("valcond", false);
+
+// 2. Explicit Purge: langsung hapus packet in-flight yang bertentangan
+flow.setConditionState("valcond", false, { purgeInFlight: true });
+// atau shorthand boolean:
+flow.setConditionState("valcond", false, true);
 ```
 
 #### `flow.getConditionState(nodeId)`
@@ -496,9 +506,27 @@ flow.onThreadArrival((threadNode, packet) => {});
 // Condition evaluation
 flow.on("conditionEvaluated", ({ nodeId, result, forced }) => {});
 
-// Node interaction
-flow.on("nodeClick", (node) => {});
-flow.on("nodeDrag", (node) => {});
+// Node interaction / click events
+flow.onNodeClick((node, event) => {
+   console.log("Any node clicked:", node.id);
+});
+
+// Specific node click
+flow.onNodeClick("node_id", (node, event) => {
+   console.log("Specific node clicked:", node.id);
+});
+
+// Direct callback on node configuration
+flow.addNode({
+   id: "my_node",
+   label: "Interactive Node",
+   onClick: (node, event) => {
+      console.log("Direct onClick handler:", node.id);
+   },
+});
+
+// Canvas empty space click
+flow.on("canvasClick", (event) => {});
 ```
 
 ---

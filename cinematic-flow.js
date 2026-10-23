@@ -50,6 +50,8 @@ class CinematicFlow {
             maxDpr: 1.5,
             performanceModeOnDrag: true,
             maxPackets: 25,
+            purgeInFlight: false, // Default: graceful in-flight completion (packets in-flight finish their journey)
+            purgeContradictoryPackets: false,
             onNodeClick: null,
             onCanvasClick: null,
          },
@@ -201,7 +203,9 @@ class CinematicFlow {
    _calculateNodeDimensions(nodeConfig) {
       const type = (nodeConfig.type || "square").toLowerCase();
       const label = String(nodeConfig.label || "").trim();
-      const sublabel = String(nodeConfig.sublabel || nodeConfig.sub || "").trim();
+      const sublabel = String(
+         nodeConfig.sublabel || nodeConfig.sub || "",
+      ).trim();
 
       // Measure text width using 1x unscaled reference fonts
       const labelFont =
@@ -224,7 +228,9 @@ class CinematicFlow {
          // Rhombus diamond narrows significantly towards top & bottom (sublabel is at cy + 18px)
          const diamondWidthForSub = subWidth * 1.8 + 40;
          const diamondWidthForLabel = labelWidth + 80;
-         const calculatedWidth = Math.ceil(Math.max(diamondWidthForLabel, diamondWidthForSub));
+         const calculatedWidth = Math.ceil(
+            Math.max(diamondWidthForLabel, diamondWidthForSub),
+         );
          const w = Math.max(nodeConfig.width || minWidth, calculatedWidth);
          return { width: w, height: h };
       } else if (type === "input") {
@@ -319,6 +325,14 @@ class CinematicFlow {
             cpuBars: [0.3, 0.6, 0.9, 0.4, 0.7],
          },
          customData: nodeConfig.data || {},
+         onClick:
+            typeof nodeConfig.onClick === "function"
+               ? nodeConfig.onClick
+               : null,
+         onArrival:
+            typeof nodeConfig.onArrival === "function"
+               ? nodeConfig.onArrival
+               : null,
       };
 
       if (type === "thread") {
@@ -636,7 +650,8 @@ class CinematicFlow {
       if (srcNode.type === "conditional") {
          const { trueEdge, falseEdge } = this._getConditionalEdges(srcNode.id);
          if (
-            (srcNode.forcedState === false || srcNode.forcedState === "false") &&
+            (srcNode.forcedState === false ||
+               srcNode.forcedState === "false") &&
             (edge === trueEdge || this._isEdgeSuccessBranch(edge) === true)
          ) {
             return false;
@@ -731,7 +746,12 @@ class CinematicFlow {
          const cfg = sourceId;
          sourceId = cfg.source || cfg.from || cfg.id;
          targetId =
-            cfg.target || cfg.to || cfg.label || cfg.color || cfg.route || targetId;
+            cfg.target ||
+            cfg.to ||
+            cfg.label ||
+            cfg.color ||
+            cfg.route ||
+            targetId;
          colorOverride = cfg.colorOverride || cfg.color || colorOverride;
          options = Object.assign({}, cfg, options);
       }
@@ -917,20 +937,63 @@ class CinematicFlow {
    }
 
    /**
+    * Register a click listener for nodes.
+    * - Listen to ALL node clicks: flow.onNodeClick((node, event) => {})
+    * - Listen to a SPECIFIC node: flow.onNodeClick('my_node_id', (node, event) => {})
+    * @param {string|Object|Function} nodeIdOrCallback - Target node ID, node object, or global callback
+    * @param {Function} [callback] - Callback (node, event) => {}
+    * @returns {CinematicFlow}
+    */
+   onNodeClick(nodeIdOrCallback, callback) {
+      if (typeof nodeIdOrCallback === "function") {
+         return this.on("nodeClick", nodeIdOrCallback);
+      }
+      const nodeId =
+         nodeIdOrCallback && typeof nodeIdOrCallback === "object"
+            ? nodeIdOrCallback.id
+            : nodeIdOrCallback;
+      if (nodeId && typeof callback === "function") {
+         return this.on(`nodeClick:${nodeId}`, callback);
+      }
+      return this;
+   }
+
+   /**
     * Set forced condition state for a conditional node.
-    * Automatically purges conflicting in-flight packets and notifies listeners.
+    * Default behavior is graceful in-flight completion: existing in-flight packets finish their journey.
+    * To purge contradictory packets immediately, pass { purgeInFlight: true } or true as 3rd param.
     * @param {string} nodeId - ID of the conditional node
     * @param {boolean|string} state - true, false, or 'auto'/'random'
+    * @param {boolean|Object} [options] - Options or boolean purgeInFlight (default: false = graceful)
     */
-   setConditionState(nodeId, state) {
+   setConditionState(nodeId, state, options = {}) {
       const node = this.nodes.find((n) => n.id === nodeId);
       if (!node) return null;
       if (state === "true" || state === true) node.forcedState = true;
       else if (state === "false" || state === false) node.forcedState = false;
       else node.forcedState = "auto";
 
-      // Instantly purge any in-flight packets on edges leaving this conditional node that contradict the new state
-      if (node.forcedState !== "auto") {
+      // Resolve purge option (default: false -> graceful in-flight completion)
+      let shouldPurge = false;
+      if (typeof options === "boolean") {
+         shouldPurge = options;
+      } else if (options && typeof options === "object") {
+         shouldPurge =
+            options.purgeInFlight ??
+            options.purgeContradictoryPackets ??
+            options.purge ??
+            this.options.purgeInFlight ??
+            this.options.purgeContradictoryPackets ??
+            false;
+      } else {
+         shouldPurge =
+            this.options.purgeInFlight ??
+            this.options.purgeContradictoryPackets ??
+            false;
+      }
+
+      // Only purge if explicitly configured
+      if (shouldPurge && node.forcedState !== "auto") {
          const { trueEdge, falseEdge } = this._getConditionalEdges(nodeId);
          this.packets = this.packets.filter((pkt) => {
             if (pkt.edge && pkt.edge.source === nodeId) {
@@ -969,6 +1032,11 @@ class CinematicFlow {
             state: node.forcedState,
          });
       }
+      this.emit("conditionChange", {
+         nodeId,
+         node,
+         state: node.forcedState,
+      });
 
       return node.forcedState;
    }
@@ -983,8 +1051,10 @@ class CinematicFlow {
 
    /**
     * Toggle condition state of a conditional node: auto -> true -> false -> auto
+    * @param {string} nodeId
+    * @param {boolean|Object} [options]
     */
-   toggleConditionState(nodeId) {
+   toggleConditionState(nodeId, options = {}) {
       const node = this.nodes.find((n) => n.id === nodeId);
       if (!node) return null;
       if (
@@ -992,11 +1062,11 @@ class CinematicFlow {
          node.forcedState === null ||
          node.forcedState === undefined
       ) {
-         return this.setConditionState(nodeId, true);
+         return this.setConditionState(nodeId, true, options);
       } else if (node.forcedState === true) {
-         return this.setConditionState(nodeId, false);
+         return this.setConditionState(nodeId, false, options);
       } else {
-         return this.setConditionState(nodeId, "auto");
+         return this.setConditionState(nodeId, "auto", options);
       }
    }
 
@@ -1010,10 +1080,12 @@ class CinematicFlow {
 
    /**
     * Set all conditional nodes in diagram to a uniform state (true, false, or 'auto')
+    * @param {boolean|string} state
+    * @param {boolean|Object} [options]
     */
-   setAllConditions(state) {
+   setAllConditions(state, options = {}) {
       this.getConditionNodes().forEach((n) =>
-         this.setConditionState(n.id, state),
+         this.setConditionState(n.id, state, options),
       );
    }
 
@@ -1339,10 +1411,15 @@ class CinematicFlow {
                if (!s) return;
                if (s.includes("->")) {
                   const [src, tgt] = s.split("->").map((p) => p.trim());
-                  if (src) parsed.push({ sourceId: src, routeSelector: tgt || null });
-               } else if (s.includes(":") && !this.nodes.some((n) => n.id === s)) {
+                  if (src)
+                     parsed.push({ sourceId: src, routeSelector: tgt || null });
+               } else if (
+                  s.includes(":") &&
+                  !this.nodes.some((n) => n.id === s)
+               ) {
                   const [src, tgt] = s.split(":").map((p) => p.trim());
-                  if (src) parsed.push({ sourceId: src, routeSelector: tgt || null });
+                  if (src)
+                     parsed.push({ sourceId: src, routeSelector: tgt || null });
                } else {
                   parsed.push({ sourceId: s, routeSelector: null });
                }
@@ -1350,9 +1427,17 @@ class CinematicFlow {
          } else if (typeof item === "object" && item !== null) {
             const sourceId = item.from || item.source || item.id;
             const routeSelector =
-               item.to || item.target || item.label || item.color || item.route || null;
+               item.to ||
+               item.target ||
+               item.label ||
+               item.color ||
+               item.route ||
+               null;
             if (sourceId) {
-               parsed.push({ sourceId: String(sourceId).trim(), routeSelector });
+               parsed.push({
+                  sourceId: String(sourceId).trim(),
+                  routeSelector,
+               });
             }
          }
       });
@@ -1401,7 +1486,9 @@ class CinematicFlow {
                if (!src) return;
 
                const routeSelector =
-                  this._autoSpawnRoutes.get(sourceId) || src.activeRoute || null;
+                  this._autoSpawnRoutes.get(sourceId) ||
+                  src.activeRoute ||
+                  null;
 
                if (routeSelector) {
                   const specificEdge = this._findEdgeBySelector(
@@ -1553,7 +1640,9 @@ class CinematicFlow {
                   typeof routeSelector === "object" &&
                   typeof current === "object"
                ) {
-                  return JSON.stringify(routeSelector) === JSON.stringify(current);
+                  return (
+                     JSON.stringify(routeSelector) === JSON.stringify(current)
+                  );
                }
                return current === routeSelector;
             }
@@ -1680,8 +1769,13 @@ class CinematicFlow {
       }
 
       if (candidateEdges.length > 0) {
-         const edge = candidateEdges[Math.floor(Math.random() * candidateEdges.length)];
-         return this.triggerPacket(edge.source, edge.target, colorOverride || edge.color);
+         const edge =
+            candidateEdges[Math.floor(Math.random() * candidateEdges.length)];
+         return this.triggerPacket(
+            edge.source,
+            edge.target,
+            colorOverride || edge.color,
+         );
       }
       return null;
    }
@@ -1838,7 +1932,8 @@ class CinematicFlow {
    }
 
    _createGridPattern() {
-      if (typeof document === "undefined" || !document.createElement) return null;
+      if (typeof document === "undefined" || !document.createElement)
+         return null;
       try {
          const patternCanvas = document.createElement("canvas");
          patternCanvas.width = 36;
@@ -2553,9 +2648,9 @@ class CinematicFlow {
       ctx.font = `500 ${Math.max(1, 8 * this.camera.scale)}px 'Plus Jakarta Sans', sans-serif`;
       const stateSubtitle =
          node.forcedState === true
-            ? "● ALWAYS TRUE"
+            ? "● TRUE"
             : node.forcedState === false
-              ? "● ALWAYS FALSE"
+              ? "● FALSE"
               : node.sublabel || "AUTO EVAL";
       ctx.fillText(stateSubtitle, cx, cy + 18 * this.camera.scale);
 
@@ -2970,18 +3065,43 @@ class CinematicFlow {
             }
          } else if (isClick) {
             if (this._mouseDownNode) {
-               // Node clicked! Trigger callback and auto zoom
-               if (typeof this.options.onNodeClick === "function") {
-                  this.options.onNodeClick(this._mouseDownNode);
+               const clickedNode = this._mouseDownNode;
+
+               // Direct node callback (configured on node itself)
+               if (typeof clickedNode.onClick === "function") {
+                  try {
+                     clickedNode.onClick(clickedNode, e);
+                  } catch (err) {
+                     console.error(
+                        `Error in onClick for node "${clickedNode.id}":`,
+                        err,
+                     );
+                  }
                }
-               if (this.options.zoomOnClick !== false) {
-                  this.focusNode(this._mouseDownNode.id, true, 1.45);
+
+               // Global option callback
+               if (typeof this.options.onNodeClick === "function") {
+                  try {
+                     this.options.onNodeClick(clickedNode, e);
+                  } catch (err) {
+                     console.error("Error in options.onNodeClick:", err);
+                  }
+               }
+
+               // Event emitter
+               this.emit("nodeClick", clickedNode, e);
+               this.emit("nodeClick:" + clickedNode.id, clickedNode, e);
+
+               // Auto zoom if enabled and not prevented
+               if (this.options.zoomOnClick !== false && !e.defaultPrevented) {
+                  this.focusNode(clickedNode.id, true, 1.45);
                }
             } else {
                // Empty Canvas clicked
                if (typeof this.options.onCanvasClick === "function") {
-                  this.options.onCanvasClick();
+                  this.options.onCanvasClick(e);
                }
+               this.emit("canvasClick", e);
             }
          }
 
@@ -3009,6 +3129,11 @@ class CinematicFlow {
             this.camera.x = this.camera.targetX;
             this.camera.y = this.camera.targetY;
             this.lastMousePos = { x: e.clientX, y: e.clientY };
+         } else {
+            // Hover cursor pointer over nodes
+            const worldPos = this._screenToWorld(mouseX, mouseY);
+            const hoveredNode = this._findNodeAt(worldPos.x, worldPos.y);
+            c.style.cursor = hoveredNode ? "pointer" : "default";
          }
 
          this.lastMousePos = { x: e.clientX, y: e.clientY };
@@ -3261,24 +3386,45 @@ if (
          return this.on("threadArrive", callback);
       }
 
+      onNodeClick(nodeIdOrCallback, callback) {
+         if (this.flow) {
+            return this.flow.onNodeClick(nodeIdOrCallback, callback);
+         }
+         if (!this._pendingListeners) this._pendingListeners = [];
+         if (typeof nodeIdOrCallback === "function") {
+            this._pendingListeners.push(["nodeClick", nodeIdOrCallback]);
+         } else {
+            const nodeId =
+               nodeIdOrCallback && typeof nodeIdOrCallback === "object"
+                  ? nodeIdOrCallback.id
+                  : nodeIdOrCallback;
+            this._pendingListeners.push([`nodeClick:${nodeId}`, callback]);
+         }
+         return this;
+      }
+
       getConditionNodes() {
          return this.flow ? this.flow.getConditionNodes() : [];
       }
 
-      setConditionState(nodeId, state) {
-         return this.flow ? this.flow.setConditionState(nodeId, state) : null;
+      setConditionState(nodeId, state, options = {}) {
+         return this.flow
+            ? this.flow.setConditionState(nodeId, state, options)
+            : null;
       }
 
       getConditionState(nodeId) {
          return this.flow ? this.flow.getConditionState(nodeId) : null;
       }
 
-      toggleConditionState(nodeId) {
-         return this.flow ? this.flow.toggleConditionState(nodeId) : null;
+      toggleConditionState(nodeId, options = {}) {
+         return this.flow
+            ? this.flow.toggleConditionState(nodeId, options)
+            : null;
       }
 
-      setAllConditions(state) {
-         if (this.flow) this.flow.setAllConditions(state);
+      setAllConditions(state, options = {}) {
+         if (this.flow) this.flow.setAllConditions(state, options);
       }
 
       triggerConditionSimulation(nodeId, forcedOverride = null) {
@@ -3298,9 +3444,19 @@ if (
          return this.flow ? this.flow.clearNodeRoute(nodeId) : null;
       }
 
-      triggerPacket(sourceId, targetId = null, colorOverride = null, options = {}) {
+      triggerPacket(
+         sourceId,
+         targetId = null,
+         colorOverride = null,
+         options = {},
+      ) {
          return this.flow
-            ? this.flow.triggerPacket(sourceId, targetId, colorOverride, options)
+            ? this.flow.triggerPacket(
+                 sourceId,
+                 targetId,
+                 colorOverride,
+                 options,
+              )
             : null;
       }
 
@@ -3327,7 +3483,9 @@ if (
       }
 
       isAutoSpawnRunning(nodeId = null, routeSelector = null) {
-         return this.flow ? this.flow.isAutoSpawnRunning(nodeId, routeSelector) : false;
+         return this.flow
+            ? this.flow.isAutoSpawnRunning(nodeId, routeSelector)
+            : false;
       }
 
       getAutoSpawn(nodeId = null) {
